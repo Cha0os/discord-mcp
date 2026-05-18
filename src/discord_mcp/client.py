@@ -181,13 +181,53 @@ async def get_guilds(state: ClientState) -> tuple[ClientState, list[DiscordGuild
     if not state.page:
         raise RuntimeError("Browser page not initialized")
 
-    logger.debug("Starting guild detection process")
+    # Ensure we're on a discord.com origin for authenticated fetch() calls.
+    if not state.page.url.startswith("https://discord.com"):
+        await state.page.goto(
+            "https://discord.com/channels/@me", wait_until="domcontentloaded"
+        )
+
+    # Fast path: Discord REST API (~0.5s vs ~10-15s for DOM scraping)
+    token: str | None = None
+    try:
+        storage = await state.page.context.storage_state()
+        for origin in storage.get("origins", []):
+            for item in origin.get("localStorage", []):
+                if item.get("name") == "token":
+                    token = item.get("value", "").strip('"')
+                    break
+            if token:
+                break
+    except Exception:
+        pass
+
+    if token:
+        api_guilds: list[dict] | None = await state.page.evaluate(
+            """async (token) => {
+                try {
+                    const resp = await fetch('/api/v9/users/@me/guilds?limit=200', {
+                        headers: { 'Authorization': token }
+                    });
+                    if (!resp.ok) return null;
+                    const data = await resp.json();
+                    if (!Array.isArray(data)) return null;
+                    return data.map(g => ({ id: String(g.id), name: g.name || '', icon: g.icon || null }));
+                } catch { return null; }
+            }""",
+            token,
+        )
+        if api_guilds:
+            logger.debug(f"REST API returned {len(api_guilds)} guilds")
+            return state, [
+                DiscordGuild(id=g["id"], name=g["name"], icon=g["icon"])
+                for g in api_guilds
+            ]
+
+    # Slow path fallback: DOM scraping
+    logger.debug("No auth token; falling back to DOM scraping for guilds")
     await state.page.goto(
         "https://discord.com/channels/@me", wait_until="domcontentloaded"
     )
-    logger.debug(f"Navigated to Discord, current URL: {state.page.url}")
-
-    # Wait for Discord to fully load guilds with text content
     try:
         await state.page.wait_for_selector(
             '[data-list-id="guildsnav"] [role="treeitem"]',
@@ -195,8 +235,6 @@ async def get_guilds(state: ClientState) -> tuple[ClientState, list[DiscordGuild
             timeout=15000,
         )
         await state.page.wait_for_timeout(5000)
-
-        # Scroll guild navigation to load all guilds
         await state.page.evaluate("""
             () => {
                 const guildNav = document.querySelector('[data-list-id="guildsnav"]');
@@ -220,60 +258,47 @@ async def get_guilds(state: ClientState) -> tuple[ClientState, list[DiscordGuild
     except Exception:
         pass
 
-    # Extract guild information from navigation elements
     guilds_data = await state.page.evaluate("""
         () => {
             const guilds = [];
             const treeItems = document.querySelectorAll('[data-list-id="guildsnav"] [role="treeitem"]');
-            
             treeItems.forEach(item => {
                 const listItemId = item.getAttribute('data-list-item-id');
                 if (listItemId?.startsWith('guildsnav___') && listItemId !== 'guildsnav___home') {
                     const guildId = listItemId.replace('guildsnav___', '');
                     if (/^[0-9]+$/.test(guildId)) {
-                        // Extract guild name from tree item text
                         let guildName = null;
                         const textElements = item.querySelectorAll('*');
                         for (let elem of textElements) {
                             const text = elem.textContent?.trim();
-                            if (text && text.length > 2 && text.length < 100 && 
+                            if (text && text.length > 2 && text.length < 100 &&
                                 !text.includes('notification') && !text.includes('unread') &&
                                 !text.match(/^\\d+$/)) {
                                 guildName = text;
                                 break;
                             }
                         }
-                        
                         if (!guildName) {
                             const fullText = item.textContent?.trim();
                             if (fullText) {
                                 guildName = fullText.replace(/^\\d+\\s+mentions?,\\s*/, '').replace(/\\s+/g, ' ').trim();
                             }
                         }
-                        
-                        // Clean up mention prefixes
                         if (guildName) {
                             guildName = guildName.replace(/^\\d+\\s+mentions?,\\s*/, '').trim();
                         }
-                        
                         if (guildName && !guilds.some(g => g.id === guildId)) {
                             guilds.push({ id: guildId, name: guildName });
                         }
                     }
                 }
             });
-            
             return guilds;
         }
     """)
-
-    # Convert JavaScript results to DiscordGuild objects
-    guilds = [
-        DiscordGuild(id=guild_data["id"], name=guild_data["name"], icon=None)
-        for guild_data in guilds_data
+    return state, [
+        DiscordGuild(id=g["id"], name=g["name"], icon=None) for g in guilds_data
     ]
-
-    return state, guilds
 
 
 async def get_guild_channels(
@@ -283,91 +308,63 @@ async def get_guild_channels(
     if not state.page:
         raise RuntimeError("Browser page not initialized")
 
+    # Extract the auth token directly from Playwright's storage state API.
+    # window.localStorage is blocked by Discord's JS context (returns null via evaluate),
+    # but page.context.storage_state() reads the engine-level storage and always works.
+    token: str | None = None
+    try:
+        storage = await state.page.context.storage_state()
+        for origin in storage.get("origins", []):
+            for item in origin.get("localStorage", []):
+                if item.get("name") == "token":
+                    token = item.get("value", "").strip('"')
+                    break
+            if token:
+                break
+    except Exception:
+        pass
+    logger.debug(f"Token from storage_state: {'found' if token else 'not found'}")
+
     await state.page.goto(
         f"https://discord.com/channels/{guild_id}", wait_until="domcontentloaded"
     )
-    await state.page.wait_for_timeout(3000)
+    await state.page.wait_for_timeout(2000)
 
-    # Helper function to extract channels
-    def extract_channels_js() -> str:
-        return f"""
-            (() => {{
-                const channels = [];
-                const seenIds = new Set();
-                const links = document.querySelectorAll('a[href*="/channels/"]');
-                
-                links.forEach(link => {{
-                    const match = link.href.match(/\\/channels\\/{guild_id}\\/([0-9]+)/);
-                    if (match) {{
-                        const channelId = match[1];
-                        if (!seenIds.has(channelId)) {{
-                            seenIds.add(channelId);
-                            let name = link.textContent?.trim() || '';
-                            name = name.replace(/^[^a-zA-Z0-9#-_]+/, '').trim();
-                            name = name.replace(/\\s+/g, ' ').trim();
-                            channels.push({{
-                                id: channelId,
-                                name: name || `channel-${{channelId}}`,
-                                href: link.href
-                            }});
-                        }}
-                    }}
-                }});
-                return channels;
-            }})()
-        """
-
-    # Step 1: Get original channels
-    logger.debug("Getting original channels")
-    original_channels = await state.page.evaluate(extract_channels_js())
-    logger.debug(f"Found {len(original_channels)} original channels")
-
-    # Step 2: Click Browse Channels and get additional channels
-    browse_channels = []
-    try:
-        browse_element = await state.page.query_selector(
-            '*:has-text("Browse Channels")'
+    # Step 3: if we have a token, call Discord's REST API — returns ALL channels at once.
+    if token:
+        api_channels: list[dict] | None = await state.page.evaluate(
+            """async ([token, guildId]) => {
+                try {
+                    const resp = await fetch('/api/v9/guilds/' + guildId + '/channels', {
+                        headers: { 'Authorization': token }
+                    });
+                    if (!resp.ok) return null;
+                    const data = await resp.json();
+                    if (!Array.isArray(data)) return null;
+                    return data.map(ch => ({
+                        id: String(ch.id),
+                        name: ch.name || '',
+                        type: ch.type ?? 0
+                    }));
+                } catch { return null; }
+            }""",
+            [token, guild_id],
         )
-        if browse_element and await browse_element.is_visible():
-            await browse_element.click()
-            await state.page.wait_for_timeout(5000)
-            logger.debug("Clicked Browse Channels")
+        if api_channels:
+            logger.debug(f"Got {len(api_channels)} channels from Discord REST API")
+            return state, [
+                DiscordChannel(
+                    id=ch["id"],
+                    name=ch["name"] or f"channel-{ch['id']}",
+                    type=ch["type"],
+                    guild_id=guild_id,
+                )
+                for ch in api_channels
+            ]
 
-            # Scroll all scrollable elements to load hidden channels
-            await state.page.evaluate("""
-                Array.from(document.querySelectorAll('*'))
-                    .filter(el => el.scrollHeight > el.clientHeight + 5)
-                    .forEach(el => el.scrollTop = el.scrollHeight)
-            """)
-            await state.page.wait_for_timeout(3000)
-
-            browse_channels = await state.page.evaluate(extract_channels_js())
-            logger.debug(f"Found {len(browse_channels)} browse channels")
-    except Exception as e:
-        logger.debug(f"Browse Channels failed: {e}")
-
-    # Step 3: Combine channels (original first, then new browse channels)
-    all_channels = {}
-    final_channels = []
-
-    # Add original channels first
-    for ch in original_channels:
-        all_channels[ch["id"]] = ch
-        final_channels.append(ch)
-
-    # Add new browse channels
-    for ch in browse_channels:
-        if ch["id"] not in all_channels:
-            final_channels.append(ch)
-
-    logger.debug(f"Total unique channels: {len(final_channels)}")
-
-    channels = [
-        DiscordChannel(id=ch["id"], name=ch["name"], type=0, guild_id=guild_id)
-        for ch in final_channels
-    ]
-
-    return state, channels
+    raise RuntimeError(
+        "Could not retrieve channels: auth token unavailable or REST API call failed"
+    )
 
 
 async def _extract_message_data(
@@ -428,42 +425,32 @@ async def _extract_message_data(
         return None
 
 
-async def get_channel_messages(
-    state: ClientState,
-    server_id: str,
+async def _read_messages_from_page(
+    page: Page,
     channel_id: str,
-    limit: int = 100,
+    limit: int,
     before: str | None = None,
     after: str | None = None,
-) -> tuple[ClientState, list[DiscordMessage]]:
-    state = await _login(state)
-    if not state.page:
-        raise RuntimeError("Browser page not initialized")
+) -> list[DiscordMessage]:
+    await page.wait_for_selector('[data-list-id="chat-messages"]', timeout=10000)
 
-    await state.page.goto(
-        f"https://discord.com/channels/{server_id}/{channel_id}",
-        wait_until="domcontentloaded",
-    )
-    await state.page.wait_for_selector('[data-list-id="chat-messages"]', timeout=15000)
-
-    # Scroll to bottom for newest messages
-    await state.page.evaluate("""
+    await page.evaluate("""
         const chat = document.querySelector('[data-list-id="chat-messages"]');
         if (chat) chat.scrollTo(0, chat.scrollHeight);
         window.scrollTo(0, document.body.scrollHeight);
     """)
-    await state.page.wait_for_timeout(2000)
+    await page.wait_for_timeout(2000)
 
-    messages = []
-    seen_ids = set()
+    messages: list[DiscordMessage] = []
+    seen_ids: set[str] = set()
 
-    for attempt in range(10):
-        elements = await state.page.query_selector_all(
+    for _ in range(10):
+        elements = await page.query_selector_all(
             '[data-list-id="chat-messages"] [id^="chat-messages-"]'
         )
         if not elements:
-            await state.page.keyboard.press("PageUp")
-            await state.page.wait_for_timeout(1000)
+            await page.keyboard.press("PageUp")
+            await page.wait_for_timeout(1000)
             continue
 
         for element in reversed(elements):
@@ -483,11 +470,178 @@ async def get_channel_messages(
             except Exception:
                 continue
 
-        if len(messages) >= limit or not elements:
+        if len(messages) >= limit:
             break
-        await state.page.keyboard.press("PageUp")
-        await state.page.wait_for_timeout(1000)
+        await page.keyboard.press("PageUp")
+        await page.wait_for_timeout(1000)
 
+    return messages
+
+
+async def _get_messages_via_api(
+    page: Page,
+    channel_id: str,
+    limit: int,
+    before: str | None = None,
+) -> list[DiscordMessage] | None:
+    """Fetch messages via Discord REST API. Returns None on failure so caller can fall back."""
+    token: str | None = None
+    try:
+        storage = await page.context.storage_state()
+        for origin in storage.get("origins", []):
+            for item in origin.get("localStorage", []):
+                if item.get("name") == "token":
+                    token = item.get("value", "").strip('"')
+                    break
+            if token:
+                break
+    except Exception:
+        return None
+
+    if not token:
+        logger.debug("No auth token found; falling back to DOM scraping")
+        return None
+
+    messages: list[DiscordMessage] = []
+    current_before = before
+
+    while len(messages) < limit:
+        batch_size = min(100, limit - len(messages))
+        api_result: list[dict] | None = await page.evaluate(
+            """async ([token, channelId, batchSize, beforeId]) => {
+                try {
+                    let url = '/api/v9/channels/' + channelId + '/messages?limit=' + batchSize;
+                    if (beforeId) url += '&before=' + beforeId;
+                    const resp = await fetch(url, { headers: { 'Authorization': token } });
+                    if (!resp.ok) return null;
+                    const data = await resp.json();
+                    if (!Array.isArray(data)) return null;
+                    return data.map(msg => ({
+                        id: String(msg.id),
+                        content: msg.content || '',
+                        author_name: (msg.author && msg.author.username) ? msg.author.username : 'Unknown',
+                        author_id: (msg.author && msg.author.id) ? String(msg.author.id) : 'unknown',
+                        timestamp: msg.timestamp,
+                        attachments: (msg.attachments || []).map(a => a.url || '').filter(u => u)
+                    }));
+                } catch (e) { return null; }
+            }""",
+            [token, channel_id, batch_size, current_before],
+        )
+
+        if not api_result:
+            return messages if messages else None
+
+        for raw in api_result:
+            try:
+                ts = datetime.fromisoformat(raw["timestamp"].replace("Z", "+00:00"))
+            except Exception:
+                ts = datetime.now(timezone.utc)
+            messages.append(
+                DiscordMessage(
+                    id=raw["id"],
+                    content=raw["content"],
+                    author_name=raw["author_name"],
+                    author_id=raw["author_id"],
+                    channel_id=channel_id,
+                    timestamp=ts,
+                    attachments=raw["attachments"],
+                )
+            )
+
+        if len(api_result) < batch_size:
+            break
+
+        current_before = api_result[-1]["id"]
+
+    logger.debug(f"REST API fetched {len(messages)} messages for channel {channel_id}")
+    return messages
+
+
+async def _get_forum_thread_ids(
+    page: Page, server_id: str, channel_id: str
+) -> list[str]:
+    await page.wait_for_timeout(3000)
+    thread_ids: list[str] = await page.evaluate(f"""
+        (() => {{
+            const seen = new Set();
+            const result = [];
+            document.querySelectorAll('a[href*="/channels/{server_id}/"]').forEach(link => {{
+                const m = link.href.match(/\\/channels\\/{server_id}\\/([0-9]+)/);
+                if (m && m[1] !== '{channel_id}' && !seen.has(m[1])) {{
+                    seen.add(m[1]);
+                    result.push(m[1]);
+                }}
+            }});
+            return result;
+        }})()
+    """)
+    return thread_ids
+
+
+async def get_channel_messages(
+    state: ClientState,
+    server_id: str,
+    channel_id: str,
+    limit: int = 100,
+    before: str | None = None,
+    after: str | None = None,
+) -> tuple[ClientState, list[DiscordMessage]]:
+    state = await _login(state)
+    if not state.page:
+        raise RuntimeError("Browser page not initialized")
+
+    # Ensure the page is on a discord.com origin so fetch() calls are authenticated.
+    # With a persistent browser session the page is usually already there.
+    if not state.page.url.startswith("https://discord.com"):
+        await state.page.goto(
+            "https://discord.com/channels/@me", wait_until="domcontentloaded"
+        )
+
+    # Fast path: Discord REST API (~0.5s vs ~12s for DOM scroll loop)
+    api_messages = await _get_messages_via_api(state.page, channel_id, limit, before)
+    if api_messages is not None:
+        if after:
+            api_messages = [m for m in api_messages if m.id > after]
+        return state, sorted(api_messages, key=lambda m: m.timestamp, reverse=True)[
+            :limit
+        ]
+
+    # Slow path fallback: navigate to channel and scrape DOM
+    await state.page.goto(
+        f"https://discord.com/channels/{server_id}/{channel_id}",
+        wait_until="domcontentloaded",
+    )
+
+    try:
+        await state.page.wait_for_selector(
+            '[data-list-id="chat-messages"]', timeout=5000
+        )
+    except Exception:
+        thread_ids = await _get_forum_thread_ids(state.page, server_id, channel_id)
+        if not thread_ids:
+            raise RuntimeError(
+                f"Channel {channel_id} is not a text channel and no forum threads were found"
+            )
+        all_msgs: list[DiscordMessage] = []
+        per_thread = max(1, limit // min(len(thread_ids), 10))
+        for tid in thread_ids[:10]:
+            try:
+                await state.page.goto(
+                    f"https://discord.com/channels/{server_id}/{tid}",
+                    wait_until="domcontentloaded",
+                )
+                msgs = await _read_messages_from_page(
+                    state.page, tid, per_thread, before, after
+                )
+                all_msgs.extend(msgs)
+            except Exception:
+                continue
+        return state, sorted(all_msgs, key=lambda m: m.timestamp, reverse=True)[:limit]
+
+    messages = await _read_messages_from_page(
+        state.page, channel_id, limit, before, after
+    )
     return state, sorted(messages, key=lambda m: m.timestamp, reverse=True)[:limit]
 
 
